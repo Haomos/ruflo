@@ -91,6 +91,12 @@ export interface AnthropicCallResult {
  * RUFLO_PROVIDER=ollama is explicitly set. Response shape is normalized
  * to the Anthropic-flavored AnthropicCallResult so existing callers
  * don't need to know which provider answered.
+ *
+ * Custom Anthropic-compatible endpoints (e.g. Kimi-for-coding, AWS Bedrock
+ * proxies) are supported via ANTHROPIC_BASE_URL. When set, requests are
+ * routed to ${ANTHROPIC_BASE_URL}/v1/messages instead of the official
+ * api.anthropic.com endpoint, while keeping the same Messages API wire
+ * format and x-api-key auth scheme.
  */
 export async function callAnthropicMessages(input: AnthropicCallInput): Promise<AnthropicCallResult> {
   const explicitProvider = (process.env.RUFLO_PROVIDER || '').toLowerCase();
@@ -110,11 +116,12 @@ export async function callAnthropicMessages(input: AnthropicCallInput): Promise<
     };
   }
   const model = input.model || 'claude-3-5-sonnet-latest';
+  const baseUrl = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
   const startedAt = Date.now();
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), input.timeoutMs || 60000);
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch(`${baseUrl}/v1/messages`, {
       method: 'POST',
       headers: {
         'x-api-key': anthropicKey,
@@ -310,16 +317,6 @@ export interface AgentExecuteResult {
 }
 
 export async function executeAgentTask(input: AgentExecuteInput): Promise<AgentExecuteResult> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return {
-      success: false,
-      agentId: input.agentId,
-      error: 'ANTHROPIC_API_KEY not set in environment',
-      remediation: 'Set the env var and re-run. The key is read at call time.',
-    };
-  }
-
   const store = loadAgentStore();
   const agent = store.agents[input.agentId];
   if (!agent) return { success: false, agentId: input.agentId, error: 'Agent not found' };
@@ -337,84 +334,46 @@ export async function executeAgentTask(input: AgentExecuteInput): Promise<AgentE
 
   const startedAt = Date.now();
 
-  try {
-    const controller = new AbortController();
-    const timeoutMs = input.timeoutMs || 60000;
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const llmResult = await callAnthropicMessages({
+    prompt: input.prompt,
+    systemPrompt,
+    model: anthropicModel,
+    maxTokens: input.maxTokens,
+    temperature: input.temperature,
+    timeoutMs: input.timeoutMs,
+  });
 
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: anthropicModel,
-        max_tokens: input.maxTokens || 1024,
-        temperature: typeof input.temperature === 'number' ? input.temperature : 0.7,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: input.prompt }],
-      }),
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
+  const durationMs = Date.now() - startedAt;
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '<unreadable error body>');
-      agent.status = 'idle';
-      saveAgentStore(store);
-      return {
-        success: false,
-        agentId: input.agentId,
-        model: anthropicModel,
-        error: `Anthropic API error ${res.status}: ${errText.slice(0, 400)}`,
-      };
-    }
-
-    const data = await res.json() as {
-      id: string;
-      model: string;
-      content: Array<{ type: string; text?: string }>;
-      stop_reason: string;
-      usage: { input_tokens: number; output_tokens: number };
-    };
-
-    const textOut = data.content
-      .filter(c => c.type === 'text' && typeof c.text === 'string')
-      .map(c => c.text as string)
-      .join('');
-
-    const result: AgentExecuteResult = {
-      success: true,
-      agentId: input.agentId,
-      messageId: data.id,
-      model: data.model,
-      stopReason: data.stop_reason,
-      output: textOut,
-      usage: {
-        inputTokens: data.usage.input_tokens,
-        outputTokens: data.usage.output_tokens,
-        totalTokens: data.usage.input_tokens + data.usage.output_tokens,
-      },
-      durationMs: Date.now() - startedAt,
-    };
-
-    agent.status = 'idle';
-    agent.lastResult = result as unknown as Record<string, unknown>;
-    saveAgentStore(store);
-
-    return result;
-  } catch (err) {
+  if (!llmResult.success) {
     agent.status = 'idle';
     saveAgentStore(store);
-    const msg = err instanceof Error ? err.message : String(err);
     return {
       success: false,
       agentId: input.agentId,
       model: anthropicModel,
-      error: `agent_execute failed: ${msg}`,
-      durationMs: Date.now() - startedAt,
+      error: llmResult.error,
+      durationMs,
+      remediation: llmResult.error?.includes('No LLM provider configured')
+        ? 'Set ANTHROPIC_API_KEY (Tier-3), OLLAMA_API_KEY (Tier-2), or ANTHROPIC_BASE_URL with a compatible key.'
+        : undefined,
     };
   }
+
+  const result: AgentExecuteResult = {
+    success: true,
+    agentId: input.agentId,
+    messageId: llmResult.messageId,
+    model: llmResult.model,
+    stopReason: llmResult.stopReason,
+    output: llmResult.output,
+    usage: llmResult.usage,
+    durationMs,
+  };
+
+  agent.status = 'idle';
+  agent.lastResult = result as unknown as Record<string, unknown>;
+  saveAgentStore(store);
+
+  return result;
 }
